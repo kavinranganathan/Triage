@@ -1,570 +1,267 @@
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MRI Triage System</title>
-    <style>
-        :root {
-            --primary: #6a11cb;
-            --primary-light: #8d67d6;
-            --background: #f4f6f9;
-            --text-dark: #1a1a2e;
-            --text-light: #f8f9fa;
-            --border-radius: 12px;
-            --shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+from flask import Flask, render_template, request, jsonify, redirect, url_for
+import os
+import base64
+from io import BytesIO
+import re
+from dotenv import load_dotenv
+from supabase import create_client
+from azure.storage.blob import BlobServiceClient
+import google.generativeai as genai
+import logging
+import uuid
+from datetime import datetime 
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+
+# Configure Supabase client
+supabase = create_client(os.getenv("SUPABASE_URL"), os.getenv("SUPABASE_KEY"))
+
+# Configure Gemini API
+def configure_gemini_api(api_key, model_name):
+    genai.configure(api_key=api_key)
+    return genai.GenerativeModel(model_name)
+
+model = configure_gemini_api(os.getenv("GEMINI_API_KEY"), "gemini-1.5-flash")
+
+# Azure Storage Configuration
+AZURE_STORAGE_CONNECTION_STRING = os.getenv("AZURE_STORAGE_CONNECTION_STRING")
+AZURE_CONTAINER_NAME = os.getenv("AZURE_CONTAINER_NAME")
+
+# Generate a response from Gemini API
+def generate_response(model, prompt, img):
+    try:
+        img_base64 = base64.b64encode(img.read()).decode("utf-8")
+        payload = [{"mime_type": "image/jpeg", "data": img_base64}, prompt]
+        response = model.generate_content(payload)
+        return response.text if response and hasattr(response, "text") else "Error: No valid response from Gemini."
+    except Exception as e:
+        logger.error(f"Error generating response: {str(e)}")
+        return str(e)
+
+# Generate prompt for MRI triage
+def generate_prompt():
+    return (
+        "You are an expert radiologist triaging brain MRI images based on severity, using a scale from 1 to 10."
+        "\n- **9.00–10.00 (Critical):** Life-threatening conditions needing immediate intervention."
+        "\n- **7.00–8.99 (Urgent):** Serious but non-immediate conditions."
+        "\n- **4.00–6.99 (Moderate):** Non-urgent but medically relevant conditions."
+        "\n- **1.00–3.99 (Low):** Normal MRI findings or minor, non-urgent abnormalities."
+        "\n\n**Instructions:**\n- Provide a severity score with at least two decimal places."
+        "\n- Explain the abnormality concisely."
+        "\n- End with 'Hence its severity score is <rating>'."
+    )
+
+# Parse Gemini response
+def parse_gemini_response(response):
+    severity_rating = None
+    comment = "No comment provided."
+    if response:
+        severity_match = re.search(r"Hence its severity score is (\d+\.\d+|\d+)", response)
+        if severity_match:
+            severity_rating = float(severity_match.group(1))
+        comment_match = re.search(r"(.*?)\s*Hence its severity score is", response, re.DOTALL)
+        if comment_match:
+            comment = comment_match.group(1).strip()
+    return severity_rating, comment
+
+# Get processed image names
+def get_processed_image_names():
+    try:
+        response = supabase.table('mri_triage_results').select('image_name').execute()
+        if not response.data:
+            return []
+        return [item['image_name'] for item in response.data]
+    except Exception as e:
+        logger.error(f"Error fetching processed images: {str(e)}")
+        return []
+
+# Fetch images from Azure Storage
+def fetch_images_from_azure():
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(AZURE_CONTAINER_NAME)
+        images = []
+        processed_images = get_processed_image_names()
+
+        for blob in container_client.list_blobs():
+            if blob.name in processed_images:
+                continue  # Skip already processed images
+            blob_client = container_client.get_blob_client(blob.name)
+            image_data = BytesIO(blob_client.download_blob().readall())
+            images.append((blob.name, image_data))
+        
+        return images
+    except Exception as e:
+        logger.error(f"Error fetching images from Azure: {str(e)}")
+        return []
+
+# Process images with severity-based sorting
+def process_images_by_severity(images):
+    results = []
+    for image_name, image_data in images:
+        severity_rating, comment = parse_gemini_response(generate_response(model, generate_prompt(), image_data))
+        image_data.seek(0)
+        image_base64 = base64.b64encode(image_data.getvalue()).decode("utf-8")
+        results.append({
+            "image_name": image_name,
+            "severity_rating": severity_rating,
+            "comment": comment,
+            "image_data": image_base64,
+            "radiologist_notes": None
+        })
+    
+    # Sort by severity in descending order
+    return sorted(results, key=lambda x: x['severity_rating'] or 0, reverse=True)
+
+# Upload image to Azure Storage
+def upload_image_to_azure(file_data, filename):
+    try:
+        blob_service_client = BlobServiceClient.from_connection_string(AZURE_STORAGE_CONNECTION_STRING)
+        container_client = blob_service_client.get_container_client(AZURE_CONTAINER_NAME)
+        
+        # Generate a unique filename if needed (prevents overwriting)
+        if not filename or filename in get_processed_image_names():
+            unique_id = str(uuid.uuid4())
+            file_extension = os.path.splitext(filename)[1] if filename else '.jpg'
+            filename = f"manual_upload_{unique_id}{file_extension}"
+        
+        # Upload the file
+        blob_client = container_client.get_blob_client(filename)
+        file_data.seek(0)
+        blob_client.upload_blob(file_data, overwrite=True)
+        
+        return filename
+    except Exception as e:
+        logger.error(f"Error uploading image to Azure: {str(e)}")
+        return None
+
+# Process a single uploaded image
+def process_uploaded_image(file_data, filename):
+    try:
+        # First, upload the image to Azure for consistency
+        azure_filename = upload_image_to_azure(file_data, filename)
+        if not azure_filename:
+            return {"error": "Failed to upload image to Azure Storage"}
+        
+        # Now process the image
+        file_data.seek(0)
+        severity_rating, comment = parse_gemini_response(generate_response(model, generate_prompt(), file_data))
+        
+        # Prepare the image data for display and storage
+        file_data.seek(0)
+        image_base64 = base64.b64encode(file_data.read()).decode("utf-8")
+        
+        result = {
+            "image_name": azure_filename,
+            "severity_rating": severity_rating,
+            "comment": comment,
+            "image_data": image_base64,
+            "radiologist_notes": None
         }
-
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background-color: var(--background);
-            color: var(--text-dark);
-            line-height: 1.6;
-        }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 20px;
-        }
-
-        .header {
-            background-color: var(--primary);
-            color: var(--text-light);
-            padding: 20px;
-            border-radius: var(--border-radius);
-            margin-bottom: 20px;
-            box-shadow: var(--shadow);
-        }
-
-        .header h1 {
-            font-size: 24px;
-            font-weight: 600;
-        }
-
-        .tabs {
-            display: flex;
-            background-color: white;
-            border-radius: var(--border-radius);
-            overflow: hidden;
-            box-shadow: var(--shadow);
-            margin-bottom: 20px;
-        }
-
-        .tab {
-            flex: 1;
-            padding: 15px;
-            text-align: center;
-            cursor: pointer;
-            color: var(--primary);
-            font-weight: 500;
-            transition: all 0.3s ease;
-            border-bottom: 3px solid transparent;
-        }
-
-        .tab:hover {
-            background-color: rgba(106, 17, 203, 0.05);
-        }
-
-        .tab.active {
-            border-bottom-color: var(--primary);
-            background-color: rgba(106, 17, 203, 0.1);
-        }
-
-        .tab-content {
-            display: none;
-            background-color: white;
-            border-radius: var(--border-radius);
-            padding: 20px;
-            box-shadow: var(--shadow);
-        }
-
-        .tab-content.active {
-            display: block;
-        }
-
-        .upload-section {
-            display: flex;
-            flex-direction: column;
-            gap: 15px;
-        }
-
-        .file-input-wrapper {
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .file-input {
-            display: none;
-        }
-
-        .file-input-label {
-            background-color: var(--primary);
-            color: white;
-            padding: 12px 20px;
-            border-radius: var(--border-radius);
-            cursor: pointer;
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            gap: 10px;
-            transition: background-color 0.3s ease;
-        }
-
-        .file-input-label:hover {
-            background-color: var(--primary-light);
-        }
-
-        .file-list {
-            border: 2px dashed var(--primary);
-            border-radius: var(--border-radius);
-            padding: 15px;
-            min-height: 100px;
-            display: flex;
-            flex-direction: column;
-            gap: 10px;
-        }
-
-        .result-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
-            gap: 20px;
-            margin-top: 20px;
-        }
-
-        .result-card {
-            background-color: white;
-            border-radius: var(--border-radius);
-            box-shadow: var(--shadow);
-            overflow: hidden;
-            transition: transform 0.3s ease;
-        }
-
-        .result-card:hover {
-            transform: translateY(-5px);
-        }
-
-        .result-image {
-            width: 100%;
-            height: 200px;
-            object-fit: cover;
-        }
-
-        .result-details {
-            padding: 15px;
-        }
-
-        .severity-badge {
-            display: inline-block;
-            padding: 5px 10px;
-            border-radius: 20px;
-            font-size: 12px;
-            font-weight: 600;
-            margin-bottom: 10px;
-        }
-
-        .severity-critical {
-            background-color: #ff4d4d;
-            color: white;
-        }
-
-        .severity-urgent {
-            background-color: #ff8c1a;
-            color: white;
-        }
-
-        .severity-moderate {
-            background-color: #4d79ff;
-            color: white;
-        }
-
-        .severity-low {
-            background-color: #2ecc71;
-            color: white;
-        }
-
-        .more-details {
-            display: none;
-            padding: 10px;
-            background-color: #f9f9f9;
-            border-top: 1px solid #eee;
-        }
-
-        .result-card.expanded .more-details {
-            display: block;
-        }
-
-        .more-details-toggle {
-            cursor: pointer;
-            color: var(--primary);
-            user-select: none;
-            margin-top: 10px;
-            text-align: right;
-            font-size: 0.9em;
-        }
-
-        .radiologist-notes {
-            width: 100%;
-            min-height: 100px;
-            margin-top: 10px;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: var(--border-radius);
-        }
-
-        .status-message {
-            padding: 15px;
-            border-radius: var(--border-radius);
-            margin-bottom: 15px;
-            text-align: center;
-        }
-
-        .status-success {
-            background-color: rgba(46, 204, 113, 0.1);
-            color: #2ecc71;
-            border: 1px solid rgba(46, 204, 113, 0.2);
-        }
-
-        .status-info {
-            background-color: rgba(52, 152, 219, 0.1);
-            color: #3498db;
-            border: 1px solid rgba(52, 152, 219, 0.2);
-        }
-
-        .spinner {
-            display: flex;
-            justify-content: center;
-            align-items: center;
-            margin: 20px 0;
-        }
-
-        .spinner::after {
-            content: '';
-            width: 50px;
-            height: 50px;
-            border: 5px solid var(--primary);
-            border-top-color: transparent;
-            border-radius: 50%;
-            animation: spin 1s linear infinite;
-        }
-
-        @keyframes spin {
-            0% { transform: rotate(0deg); }
-            100% { transform: rotate(360deg); }
-        }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <header class="header">
-            <h1>MRI Triage System</h1>
-        </header>
-
-        <div class="tabs">
-            <div class="tab active" data-tab="new-analysis">New Analysis</div>
-            <div class="tab" data-tab="upload">Upload Image</div>
-            <div class="tab" data-tab="history">History</div>
-        </div>
-
-        <div class="tab-content active" id="new-analysis-content">
-            <button id="fetchImagesBtn" class="file-input-label">
-                Fetch & Analyze Images
-            </button>
-            <div id="statusMessage"></div>
-            <div id="results" class="result-grid"></div>
-        </div>
-
-        <div class="tab-content" id="upload-content">
-            <div class="upload-section">
-                <div class="file-input-wrapper">
-                    <input type="file" id="fileInput" class="file-input" accept="image/*" multiple>
-                    <label for="fileInput" class="file-input-label">
-                        Select MRI Images
-                    </label>
-                    <div id="fileList" class="file-list">No files selected</div>
-                </div>
-                <div class="button-group">
-                    <button id="uploadBtn" class="file-input-label">Upload & Analyze</button>
-                    <button id="clearFilesBtn" class="file-input-label" style="background-color: #7f8c8d;">Clear Selection</button>
-                </div>
-            </div>
-            <div id="uploadStatusMessage"></div>
-            <div id="uploadResults" class="result-grid"></div>
-        </div>
-
-        <div class="tab-content" id="history-content">
-            <div id="historyResults" class="result-grid"></div>
-        </div>
-    </div>
-
-    <script>
-        // Utility Functions
-        function toggleLoading(show, elementId = 'statusMessage') {
-            const statusMessage = document.getElementById(elementId);
-            
-            if (show) {
-                statusMessage.innerHTML = `
-                    <div class="spinner"></div>
-                `;
-            } else {
-                statusMessage.innerHTML = '';
-            }
-        }
-
-        function showStatusMessage(message, type = 'info', elementId = 'statusMessage') {
-            const statusDiv = document.getElementById(elementId);
-            statusDiv.innerHTML = `
-                <div class="status-message status-${type}">
-                    ${message}
-                </div>
-            `;
-        }
-
-        function getSeverityInfo(rating) {
-            if (rating >= 9) return { class: 'severity-critical', label: 'Critical' };
-            if (rating >= 7) return { class: 'severity-urgent', label: 'Urgent' };
-            if (rating >= 4) return { class: 'severity-moderate', label: 'Moderate' };
-            return { class: 'severity-low', label: 'Low' };
-        }
-
-        function truncateText(text, maxLength = 100) {
-            if (!text) return 'No details available';
-            if (text.length <= maxLength) return text;
-            return text.substr(0, maxLength) + '...';
-        }
-
-        function createResultCard(result, isHistory = false) {
-            const severityInfo = getSeverityInfo(result.severity_rating || 0);
-            const truncatedComment = truncateText(result.comment, 150);
-            
-            return `
-                <div class="result-card" data-image-name="${result.image_name || ''}">
-                    <img src="data:image/jpeg;base64,${result.image_data}" class="result-image" alt="MRI Scan">
-                    <div class="result-details">
-                        <span class="severity-badge ${severityInfo.class}">
-                            ${severityInfo.label}
-                        </span>
-                        <h3>${result.image_name || 'MRI Scan'}</h3>
-                        <p><strong>Severity Rating:</strong> ${(result.severity_rating || 0).toFixed(1)}/10</p>
-                        <p class="truncate-text" data-full-text="${result.comment || ''}">
-                            ${truncatedComment}
-                            ${result.comment && result.comment.length > 150 
-                                ? '<span class="more-link">More</span>' 
-                                : ''}
-                        </p>
-                        <div class="more-details-toggle">ⓘ More Details</div>
-                        <div class="more-details">
-                            <p><strong>Detailed Comment:</strong> ${result.comment || 'No additional details'}</p>
-                            ${result.radiologist_notes 
-                                ? `<p><strong>Radiologist Notes:</strong> ${result.radiologist_notes}</p>` 
-                                : ''}
-                        </div>
-                        ${!isHistory 
-                            ? `<textarea placeholder="Add radiologist notes..." class="radiologist-notes"></textarea>
-                               <button class="save-notes-btn file-input-label" style="margin-top: 10px;">Save Notes</button>`
-                            : ''}
-                    </div>
-                </div>
-            `;
-        }
-
-        // Tab Switching
-        document.querySelectorAll('.tab').forEach(tab => {
-            tab.addEventListener('click', () => {
-                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-                document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-                
-                tab.classList.add('active');
-                document.getElementById(`${tab.dataset.tab}-content`).classList.add('active');
-
-                // Fetch history when history tab is clicked
-                if (tab.dataset.tab === 'history') {
-                    fetchHistory();
-                }
-            });
-        });
-
-        // File upload handling
-        document.getElementById('fileInput').addEventListener('change', function(e) {
-            const fileList = document.getElementById('fileList');
-            fileList.innerHTML = '';
-            
-            Array.from(this.files).forEach(file => {
-                const fileItem = document.createElement('div');
-                fileItem.textContent = file.name;
-                fileList.appendChild(fileItem);
-            });
-        });
-
-        document.getElementById('uploadBtn').addEventListener('click', () => {
-            const fileInput = document.getElementById('fileInput');
-            const uploadStatusMessage = document.getElementById('uploadStatusMessage');
-            const uploadResults = document.getElementById('uploadResults');
-
-            if (fileInput.files.length === 0) {
-                uploadStatusMessage.innerHTML = '<div class="status-message status-info">Please select at least one image</div>';
-                return;
-            }
-
-            const formData = new FormData();
-            for (let file of fileInput.files) {
-                formData.append('file', file);
-            }
-
-            toggleLoading(true, 'uploadStatusMessage');
-            fetch('/upload-image', {
-                method: 'POST',
-                body: formData
-            })
-                .then(response => response.json())
-                .then(data => {
-                    toggleLoading(false, 'uploadStatusMessage');
-                    uploadResults.innerHTML = ''; // Clear previous results
-                    
-                    if (data.results) {
-                        data.results.forEach(result => {
-                            uploadResults.innerHTML += createResultCard(result);
-                        });
-                        uploadStatusMessage.innerHTML = `<div class="status-message status-success">Successfully uploaded and analyzed ${data.results.length} image(s)</div>`;
-                    } else if (data.error) {
-                        uploadStatusMessage.innerHTML = `<div class="status-message status-info">${data.error}</div>`;
-                    }
-                })
-                .catch(error => {
-                    toggleLoading(false, 'uploadStatusMessage');
-                    uploadStatusMessage.innerHTML = '<div class="status-message status-info">Upload failed. Please try again.</div>';
-                    console.error('Error:', error);
-                });
-        });
-
-        // Clear file selection
-        document.getElementById('clearFilesBtn').addEventListener('click', () => {
-            document.getElementById('fileInput').value = '';
-            document.getElementById('fileList').innerHTML = 'No files selected';
-            document.getElementById('uploadResults').innerHTML = '';
-            document.getElementById('uploadStatusMessage').innerHTML = '';
-        });
-
-        // Fetch Images
-        document.getElementById('fetchImagesBtn').addEventListener('click', () => {
-            toggleLoading(true);
-            fetch('/fetch-images', { method: 'POST' })
-                .then(response => response.json())
-                .then(data => {
-                    toggleLoading(false);
-                    const resultsContainer = document.getElementById('results');
-                    resultsContainer.innerHTML = '';
-
-                    if (data.processed_count === 0) {
-                        showStatusMessage('No new images found for analysis.', 'info');
-                        return;
-                    }
-
-                    data.results.forEach(result => {
-                        resultsContainer.innerHTML += createResultCard(result);
-                    });
-
-                    showStatusMessage(`Successfully fetched ${data.processed_count} new MRI images.`, 'success');
-                })
-                .catch(error => {
-                    toggleLoading(false);
-                    showStatusMessage('Failed to fetch images. Please try again.', 'info');
-                    console.error('Error:', error);
-                });
-        });
-
-        // Event delegation for various interactions
-        document.addEventListener('click', (e) => {
-            // More details toggle
-            if (e.target.classList.contains('more-details-toggle')) {
-                const resultCard = e.target.closest('.result-card');
-                resultCard.classList.toggle('expanded');
-            }
-
-            // More details popup
-            if (e.target.classList.contains('more-link')) {
-                const fullText = e.target.closest('.truncate-text').dataset.fullText;
-                alert(fullText);
-            }
-
-            // Save notes
-            if (e.target.classList.contains('save-notes-btn')) {
-                const resultCard = e.target.closest('.result-card');
-                const notesTextarea = resultCard.querySelector('.radiologist-notes');
-                const radiologistNotes = notesTextarea.value.trim();
-                const imageName = resultCard.dataset.imageName;
-
-                // Get the details from the existing card
-                const severityRating = parseFloat(resultCard.querySelector('p:nth-child(3)').textContent.split(':')[1].trim());
-                const comment = resultCard.querySelector('.truncate-text').dataset.fullText;
-                const imageData = resultCard.querySelector('.result-image').src.split(',')[1];
-
-                fetch('/save-image-notes', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        image_name: imageName,
-                        radiologist_notes: radiologistNotes,
-                        severity_rating: severityRating,
-                        comment: comment,
-                        image_data: imageData
-                    })
-                })
-                    .then(response => response.json())
-                    .then(data => {
-                        if (data.message) {
-                            alert('Notes saved successfully');
-                            
-                            // Move to history or update UI
-                            const historyResults = document.getElementById('historyResults');
-                            historyResults.innerHTML += createResultCard(
-                                {
-                                    ...resultCard.dataset,
-                                    radiologist_notes: radiologistNotes,
-                                    image_name: imageName,
-                                    severity_rating: severityRating,
-                                    comment: comment,
-                                    image_data: imageData
-                                }, 
-                                true
-                            );
-                            resultCard.remove();
-                        } else {
-                            alert('Failed to save notes');
-                        }
-                    })
-                    .catch(error => {
-                        console.error('Error:', error);
-                        alert('Failed to save notes');
-                    });
-            }
-        });
-
-        // Fetch history function
-        function fetchHistory() {
-            fetch('/view-history')
-                .then(response => response.json())
-                .then(data => {
-                    const historyResults = document.getElementById('historyResults');
-                    historyResults.innerHTML = '';
-                    data.forEach(result => {
-                        historyResults.innerHTML += createResultCard(result, true);
-                    });
-                })
-                .catch(error => {
-                    console.error('Error fetching history:', error);
-                    showStatusMessage('Failed to fetch history.', 'info', 'historyResults');
-                });
-        }
-    </script>
-</body>
-</html>
+        
+        return result
+    except Exception as e:
+        logger.error(f"Error processing uploaded image: {str(e)}")
+        return {"error": str(e)}
+
+# Fetch history from Supabase
+def fetch_history_from_supabase():
+    try:
+        response = supabase.table('mri_triage_results').select('*').order('severity_rating', desc=True).execute()
+        return response.data if response.data else []  # Ensure it always returns an array
+    except Exception as e:
+        logger.error(f"Error fetching history: {str(e)}")
+        return []  # Return an empty list instead of None
+
+# Routes
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/fetch-images", methods=["POST"])
+def fetch_images():
+    images = fetch_images_from_azure()
+    
+    if not images:
+        return jsonify({"message": "No new images to process", "results": []})
+    
+    # Process images and sort by severity
+    results = process_images_by_severity(images)
+    
+    return jsonify({
+        "results": results, 
+        "processed_count": len(results)
+    })
+
+@app.route("/upload-image", methods=["POST"])
+def upload_image():
+    if 'file' not in request.files:
+        return jsonify({"error": "No file part"}), 400
+    
+    files = request.files.getlist('file')
+    if not files or files[0].filename == '':
+        return jsonify({"error": "No selected file"}), 400
+    
+    # Check if the files are allowed types
+    allowed_extensions = {'png', 'jpg', 'jpeg', 'gif'}
+    results = []
+    
+    for file in files:
+        if not ('.' in file.filename and file.filename.rsplit('.', 1)[1].lower() in allowed_extensions):
+            continue  # Skip files with invalid extensions
+        
+        # Process the uploaded image
+        file_data = BytesIO(file.read())
+        result = process_uploaded_image(file_data, file.filename)
+        
+        if "error" not in result:
+            results.append(result)
+    
+    if not results:
+        return jsonify({"error": "No valid images processed"}), 400
+    
+    return jsonify({"results": results})
+
+@app.route("/save-image-notes", methods=["POST"])
+def save_image_notes():
+    data = request.json
+    image_name = data.get('image_name')
+    radiologist_notes = data.get('radiologist_notes')
+    severity_rating = data.get('severity_rating')
+    comment = data.get('comment')
+    image_data = data.get('image_data')
+    
+    if not image_name:
+        return jsonify({"error": "Image name is required"}), 400
+    
+    try:
+        # Insert or update the record in the database
+        response = supabase.table('mri_triage_results').upsert({
+            'image_name': image_name,
+            'radiologist_notes': radiologist_notes,
+            'severity_rating': severity_rating,
+            'comment': comment,
+            'image_data': image_data,
+            'created_at': datetime.utcnow().isoformat()
+        }).execute()
+        
+        return jsonify({"message": "Notes saved successfully", "data": response.data})
+    except Exception as e:
+        logger.error(f"Error saving image notes: {str(e)}")
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/view-history", methods=["GET"])
+def view_history():
+    history = fetch_history_from_supabase()
+    return jsonify(history)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
